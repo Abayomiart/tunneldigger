@@ -1,63 +1,128 @@
-name: CI
+
+name: LexusVPN Android Build
 
 on:
   push:
-    branches:
-    - 'master'
+    branches: [main, master]
   pull_request:
-    branches:
-    - 'master'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  server:
-    name: Test Server
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - SELECT: nose
-            OLD_REV: "HEAD"
-          - SELECT: nose
-            OLD_REV: "origin/legacy"
-          - SELECT: nose
-            OLD_REV: "v0.3.0"
-          # even older servers (before 436a420aad8aff687822ce342360f5306281ea0b) have the broken
-          # Python conntrack bindings, they do not work any more
-          - SELECT: usage
-    runs-on: ubuntu-22.04
+  build:
+    name: Compilar LexusVPN APK
+    runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
-      - name: Setup
+      - name: Obter código
+        uses: actions/checkout@v4
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Localizar projeto Android
+        shell: bash
         run: |
-          set -x
-          git fetch --unshallow # GHA only does a shallow clone
-          sudo add-apt-repository universe
-          sudo apt-get -qq update
-          # This is only what we need to install on the *host*.
-          # Server and client will be built in containers set up by `setup_template` in `tunneldigger.py`
-          # as well as the `prepare_{server,client}.sh` scripts.
-          sudo apt-get --assume-no install lxc python3-lxc python3-nose linux-modules-extra-$(uname -r)
-          sudo modprobe l2tp_netlink
-          sudo modprobe l2tp_eth
-          # Newer versions of the broker don't need the following but keep it around for cross-version testing
-          sudo modprobe nf_conntrack
-          sudo modprobe nf_conntrack_netlink
-          sudo iptables -t nat -L >/dev/null
-          sudo iptables -t filter -P FORWARD ACCEPT
-      - name: Run tests
+          set -euo pipefail
+
+          if [ -f android/app/build.gradle.kts ] &&
+             { [ -f android/settings.gradle.kts ] ||
+               [ -f android/settings.gradle ]; }; then
+            echo "BUILD_DIR=android" >> "$GITHUB_ENV"
+          elif [ -f app/build.gradle.kts ] &&
+               { [ -f settings.gradle.kts ] ||
+                 [ -f settings.gradle ]; }; then
+            echo "BUILD_DIR=." >> "$GITHUB_ENV"
+          else
+            echo "ERRO: Estrutura do projeto Android não encontrada."
+            exit 1
+          fi
+
+      - name: Configurar AndroidX
+        shell: bash
         run: |
-          export SELECT=${{ matrix.SELECT }}
-          export OLD_REV=${{ matrix.OLD_REV }}
-          sudo -E ./tests/travis.sh
-  client:
-    name: Test Client
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v3
-      - name: Setup
+          set -euo pipefail
+
+          FILE="$BUILD_DIR/gradle.properties"
+          touch "$FILE"
+
+          if grep -Eq '^[[:space:]]*android\.useAndroidX[[:space:]]*=' "$FILE"; then
+            sed -i -E \
+              's/^[[:space:]]*android\.useAndroidX[[:space:]]*=.*/android.useAndroidX=true/' \
+              "$FILE"
+          else
+            echo 'android.useAndroidX=true' >> "$FILE"
+          fi
+
+          if grep -Eq '^[[:space:]]*android\.enableJetifier[[:space:]]*=' "$FILE"; then
+            sed -i -E \
+              's/^[[:space:]]*android\.enableJetifier[[:space:]]*=.*/android.enableJetifier=true/' \
+              "$FILE"
+          else
+            echo 'android.enableJetifier=true' >> "$FILE"
+          fi
+
+          echo "Propriedades AndroidX:"
+          grep -E '^android\.(useAndroidX|enableJetifier)=' "$FILE"
+
+      - name: Instalar Gradle 8.10.2
+        shell: bash
         run: |
-          sudo apt-get --assume-no install cmake libnl-3-dev libnl-genl-3-dev libasyncns-dev
-      - name: Run tests
+          set -euo pipefail
+
+          VERSION=8.10.2
+          curl -fL \
+            "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+            -o /tmp/gradle.zip
+
+          unzip -q /tmp/gradle.zip -d /tmp
+
+          echo "GRADLE_HOME=/tmp/gradle-${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Gerar Gradle Wrapper
+        shell: bash
         run: |
-          export SELECT=client
-          sudo -E ./tests/travis.sh
+          set -euo pipefail
+
+          cd "$BUILD_DIR"
+
+          "$GRADLE_HOME/bin/gradle" wrapper \
+            --gradle-version 8.10.2 \
+            --distribution-type bin
+
+          chmod +x gradlew
+
+          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f gradle/wrapper/gradle-wrapper.properties
+
+      - name: Verificar configuração
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+
+          test "$(grep '^android.useAndroidX=true$' gradle.properties)"
+          ./gradlew --version
+          ./gradlew tasks --no-daemon
+
+      - name: Compilar APK Debug
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Publicar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LexusVPN-debug-apk
+          path: |
+            android/**/build/outputs/apk/debug/*.apk
+            build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
